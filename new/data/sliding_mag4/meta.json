@@ -1,0 +1,8 @@
+{
+  "n_features": 4,
+  "window_size": 250,
+  "stride": 50,
+  "n_train": 6900,
+  "n_val": 2702,
+  "n_test": 2686
+}

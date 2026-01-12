@@ -1,0 +1,17 @@
+{
+  "n_features": 6,
+  "window_size": 250,
+  "stride": 25,
+  "n_train": 14135,
+  "n_val": 5003,
+  "n_test": 5228,
+  "feature_desc": [
+    "Bx_world_norm",
+    "By_world_norm",
+    "Bz_world_norm",
+    "|B|/50",
+    "Bh/50",
+    "dip/pi"
+  ],
+  "note": "Vector-world features: device mag rotated to global coord using yaw/pitch/roll (paper-inspired)."
+}

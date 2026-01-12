@@ -1,0 +1,11 @@
+﻿python.exe : Traceback (most recent call last):
+위치 C:\Users\sally\OneDrive\바탕 화면\lstm_new\hyena\run_all_tests.ps1:87 문자:19
++ ...   $output = & python $testScript --arch $arch --checkpoint $ckpt --da ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (Traceback (most recent call last)::String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+  File "C:\Users\sally\OneDrive\바탕 화면\lstm_new\hyena\src\test_only_unified.py", line 16, in <module>
+    import torch
+ModuleNotFoundError: No module named 'torch'
+
