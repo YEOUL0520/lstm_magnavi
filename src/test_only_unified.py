@@ -6,10 +6,26 @@ Unified test_only for LSTM + Hyena
 - Hyena output: (B,T,2) -> use last timestep (B,2)
 - IMPORTANT: Hyena is evaluated with edge_ids=zeros (same as training code)
 
-[NEW]
-- Save results to JSON + append to CSV:
-  --save-dir exp_results/scarcity/_eval
-  --tag 100pct
+[EXP RESULTS SAVE]
+- Results saved to JSON + appended to CSV.
+- You can organize outputs by experiment:
+    --exp scarcity | domain_shift | short_sequence
+  If --save-dir is omitted, it defaults to:
+    exp_results/<exp>/_eval
+
+[EXP2]
+- Sequence length truncation:
+    --truncate-last-t 150
+  This keeps only the last T timesteps from the input sequence during evaluation.
+
+[EXP3]
+- Rotation-like perturbation to simulate orientation/axis-mixing error:
+    --rot-noise-deg 10
+  Applies a small random 3D rotation to the first 3 feature dims (Bx,By,Bz)
+  per sample (same rotation across all timesteps within a sample).
+
+[Safe saving]
+- If the same JSON filename exists, automatically add suffix _1, _2, ...
 """
 
 import json
@@ -18,6 +34,7 @@ from pathlib import Path
 import argparse
 import inspect
 import sys
+from typing import Optional
 
 import numpy as np
 import torch
@@ -199,15 +216,120 @@ def forward_pred_xy(arch: str, model, features: torch.Tensor, use_amp: bool):
         raise ValueError("unknown arch")
 
 
-def save_results(save_dir: Path, arch: str, tag: str, checkpoint: Path, data_dir: Path,
-                 n_test: int, window: int, n_features: int,
-                 e: dict, m: dict, noise_mode: str, noise_levels: str):
+def resolve_save_dir(exp: str, save_dir: Optional[str]) -> Optional[Path]:
     """
-    Save per-run JSON + append CSV.
+    If save_dir is provided, use it.
+    Else, use exp_results/<exp>/_eval
     """
+    if save_dir:
+        return Path(save_dir)
+    if exp:
+        return Path("exp_results") / exp / "_eval"
+    return None
+
+
+def unique_json_path(save_dir: Path, base_name: str) -> Path:
+    """If file exists, add suffix _1, _2, ..."""
+    p = save_dir / f"{base_name}.json"
+    if not p.exists():
+        return p
+    i = 1
+    while True:
+        p2 = save_dir / f"{base_name}_{i}.json"
+        if not p2.exists():
+            return p2
+        i += 1
+
+
+# -------------------------
+# Exp3: Rotation-like perturbation
+# -------------------------
+def _axis_angle_to_R(axis: torch.Tensor, theta: torch.Tensor) -> torch.Tensor:
+    """
+    axis: (B,3) unit vectors
+    theta: (B,) radians
+    returns: (B,3,3)
+    """
+    B = axis.shape[0]
+    ax, ay, az = axis[:, 0], axis[:, 1], axis[:, 2]
+
+    ct = torch.cos(theta)
+    st = torch.sin(theta)
+    one = torch.ones_like(ct)
+
+    R = torch.zeros((B, 3, 3), device=axis.device, dtype=axis.dtype)
+
+    R[:, 0, 0] = ct + ax * ax * (one - ct)
+    R[:, 0, 1] = ax * ay * (one - ct) - az * st
+    R[:, 0, 2] = ax * az * (one - ct) + ay * st
+
+    R[:, 1, 0] = ay * ax * (one - ct) + az * st
+    R[:, 1, 1] = ct + ay * ay * (one - ct)
+    R[:, 1, 2] = ay * az * (one - ct) - ax * st
+
+    R[:, 2, 0] = az * ax * (one - ct) - ay * st
+    R[:, 2, 1] = az * ay * (one - ct) + ax * st
+    R[:, 2, 2] = ct + az * az * (one - ct)
+
+    return R
+
+
+def apply_rot_noise_xyz(features: torch.Tensor, rot_deg: float) -> torch.Tensor:
+    """
+    features: (B,T,F)
+    Apply random small rotation to first 3 dims (Bx,By,Bz) per sample.
+    Same rotation is applied to all timesteps within a sample.
+
+    Note:
+    - This is an approximation for orientation/axis-mixing error.
+    - Works only if features have at least 3 dims.
+    """
+    if rot_deg is None or rot_deg <= 1e-9:
+        return features
+    B, T, F = features.shape
+    if F < 3:
+        return features
+
+    # random axis per sample
+    axis = torch.randn((B, 3), device=features.device, dtype=features.dtype)
+    axis = axis / (axis.norm(dim=1, keepdim=True) + 1e-8)
+
+    # angle per sample ~ N(0, sigma) where sigma = rot_deg
+    theta = torch.randn((B,), device=features.device, dtype=features.dtype) * (rot_deg * np.pi / 180.0)
+
+    R = _axis_angle_to_R(axis, theta)  # (B,3,3)
+
+    xyz = features[:, :, :3]  # (B,T,3)
+    # rotate: (B,T,3) * (B,3,3)
+    xyz_rot = torch.einsum("bti,bij->btj", xyz, R)
+
+    out = features.clone()
+    out[:, :, :3] = xyz_rot
+    return out
+
+
+def save_results(
+    save_dir: Path,
+    arch: str,
+    exp: str,
+    tag: str,
+    checkpoint: Path,
+    data_dir: Path,
+    n_test: int,
+    window: int,
+    n_features: int,
+    truncate_last_t: Optional[int],
+    rot_noise_deg: float,
+    e: dict,
+    m: dict,
+    noise_mode: str,
+    noise_levels: str,
+):
+    """Save per-run JSON + append CSV."""
     save_dir.mkdir(parents=True, exist_ok=True)
 
     result = {
+        "exp": exp,
         "arch": arch,
         "tag": tag,
         "checkpoint": str(checkpoint),
@@ -215,6 +337,8 @@ def save_results(save_dir: Path, arch: str, tag: str, checkpoint: Path, data_dir
         "n_test": int(n_test),
         "window": int(window),
         "n_features": int(n_features),
+        "truncate_last_t": int(truncate_last_t) if truncate_last_t is not None else "",
+        "rot_noise_deg": float(rot_noise_deg),
 
         "euc_mae": e["mae"],
         "euc_rmse": e["rmse"],
@@ -244,13 +368,13 @@ def save_results(save_dir: Path, arch: str, tag: str, checkpoint: Path, data_dir
         "noise_levels": noise_levels,
     }
 
-    # JSON 저장
     safe_tag = tag if tag else "run"
-    json_path = save_dir / f"{arch}_{safe_tag}.json"
+    base_name = f"{arch}_{safe_tag}"
+    json_path = unique_json_path(save_dir, base_name)
+
     with json_path.open("w", encoding="utf-8") as f:
         json.dump(result, f, indent=2, ensure_ascii=False)
 
-    # CSV 누적 저장
     csv_path = save_dir / "results.csv"
     write_header = not csv_path.exists()
     with csv_path.open("a", newline="", encoding="utf-8") as f:
@@ -272,21 +396,59 @@ def main():
     ap.add_argument("--cpu", action="store_true")
     ap.add_argument("--no-noise-test", action="store_true")
 
-    # ✅ 저장 옵션 추가
-    ap.add_argument("--save-dir", type=str, default=None,
-                    help="Directory to save results (json + csv). Example: exp_results/scarcity/_eval")
-    ap.add_argument("--tag", type=str, default="",
-                    help="Tag for this run (e.g., 100pct, 050pct). Used for filename and CSV.")
+    # ✅ Experiment name (for directory grouping)
+    ap.add_argument(
+        "--exp",
+        type=str,
+        default="",
+        choices=["", "scarcity", "domain_shift", "short_sequence"],
+        help="Experiment group name. Used to auto-set save-dir if --save-dir is omitted.",
+    )
 
-    # noise 옵션: percent 기반 + sigma 기반
+    # ✅ Exp2: sequence truncation
+    ap.add_argument(
+        "--truncate-last-t",
+        type=int,
+        default=None,
+        help="Use only the last T timesteps from input sequence (Exp2). Example: 150, 75, 30",
+    )
+
+    # ✅ Exp3: rotation-like perturbation (axis mixing)
+    ap.add_argument(
+        "--rot-noise-deg",
+        type=float,
+        default=0.0,
+        help="Apply random small rotation (deg) to first 3 feature dims per sample (Exp3). Example: 5, 10, 20",
+    )
+
+    # ✅ 저장 옵션
+    ap.add_argument(
+        "--save-dir",
+        type=str,
+        default=None,
+        help="Directory to save results (json + csv). If omitted, uses exp_results/<exp>/_eval",
+    )
+    ap.add_argument(
+        "--tag",
+        type=str,
+        default="",
+        help="Tag for this run (e.g., 100pct, hyena_T150). Used for filename and CSV.",
+    )
+
+    # noise 옵션
     ap.add_argument("--noise-mode", choices=["percent", "sigma"], default="percent")
-    ap.add_argument("--noise-levels", type=str, default="1,5,10,20",
-                    help="percent: 1,5,10,20 / sigma: 0.1,0.2,0.5")
+    ap.add_argument(
+        "--noise-levels",
+        type=str,
+        default="1,5,10,20",
+        help="percent: 1,5,10,20 / sigma: 0.1,0.2,0.5",
+    )
 
     args = ap.parse_args()
 
     data_dir = Path(args.data_dir)
     ckpt_path = Path(args.checkpoint)
+    save_dir = resolve_save_dir(args.exp, args.save_dir)
 
     # device
     if (not args.cpu) and torch.cuda.is_available():
@@ -313,14 +475,20 @@ def main():
     print(f"  checkpoint: {ckpt_path}")
     print(f"  data-dir:   {data_dir}")
     print(f"  test:       {len(ds)} samples | window={window_size} | features={n_features}")
+    if args.truncate_last_t is not None:
+        print(f"  truncate:   last {args.truncate_last_t} steps")
+    if args.rot_noise_deg and args.rot_noise_deg > 0:
+        print(f"  rot-noise:  {args.rot_noise_deg} deg (axis-mixing on first 3 dims)")
+    if args.exp:
+        print(f"  exp:        {args.exp}")
     if args.tag:
         print(f"  tag:        {args.tag}")
-    if args.save_dir:
-        print(f"  save-dir:   {args.save_dir}")
+    if save_dir is not None:
+        print(f"  save-dir:   {save_dir}")
     print()
 
     # load model
-    ckpt, cfg, state = load_checkpoint(ckpt_path, device)
+    _, cfg, state = load_checkpoint(ckpt_path, device)
     model = build_model(args.arch, n_features, cfg).to(device)
 
     missing, unexpected = model.load_state_dict(state, strict=False)
@@ -343,6 +511,16 @@ def main():
         for features, targets in pbar:
             features = features.to(device)
             targets = targets.to(device)
+
+            # ✅ Exp2: 시퀀스 길이 축소 (마지막 T step만 사용)
+            if args.truncate_last_t is not None:
+                T = int(args.truncate_last_t)
+                if features.size(1) > T:
+                    features = features[:, -T:, :]
+
+            # ✅ Exp3: 회전 노이즈(축 섞임) 적용
+            if args.rot_noise_deg and args.rot_noise_deg > 0:
+                features = apply_rot_noise_xyz(features, args.rot_noise_deg)
 
             pred_xy = forward_pred_xy(args.arch, model, features, use_amp=use_amp)
 
@@ -403,8 +581,18 @@ def main():
                     features = features.to(device)
                     targets = targets.to(device)
 
+                    # ✅ Exp2: truncate
+                    if args.truncate_last_t is not None:
+                        T = int(args.truncate_last_t)
+                        if features.size(1) > T:
+                            features = features[:, -T:, :]
+
                     noise = torch.randn_like(features) * noise_std
                     noisy = features + noise
+
+                    # ✅ Exp3: rotation-like perturbation applied AFTER noise too
+                    if args.rot_noise_deg and args.rot_noise_deg > 0:
+                        noisy = apply_rot_noise_xyz(noisy, args.rot_noise_deg)
 
                     pred_xy = forward_pred_xy(args.arch, model, noisy, use_amp=use_amp)
 
@@ -433,16 +621,19 @@ def main():
     print("=" * 80)
 
     # ✅ 저장
-    if args.save_dir:
+    if save_dir is not None:
         save_results(
-            save_dir=Path(args.save_dir),
+            save_dir=save_dir,
             arch=args.arch,
+            exp=args.exp if args.exp else "",
             tag=args.tag,
             checkpoint=ckpt_path,
             data_dir=data_dir,
             n_test=len(ds),
             window=window_size,
             n_features=n_features,
+            truncate_last_t=args.truncate_last_t,
+            rot_noise_deg=args.rot_noise_deg,
             e=e,
             m=m,
             noise_mode=args.noise_mode,
